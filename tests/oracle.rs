@@ -122,3 +122,16 @@ fn apache_avro_output_decompresses_with_our_codecs() {
         assert_eq!(data, expected, "{}", ours.name());
     }
 }
+
+#[test]
+fn apache_avro_reads_files_without_records() {
+    // Just the header (magic, metadata, sync marker), with no blocks: as the Java library writes
+    // an empty file.
+    for codec in Codec::ALL {
+        let opts = WriterOptions { codec, metadata: vec![("app".into(), b"avro-kit".to_vec())], sync: Some([9; 16]), ..Default::default() };
+        let bytes = Writer::new(Vec::new(), SCHEMA, opts).unwrap().finish().unwrap();
+        assert!(bytes.ends_with(&[9; 16]));
+        let reader = apache_avro::Reader::new(&bytes[..]).unwrap_or_else(|e| panic!("{}: {e}", codec.name()));
+        assert_eq!(reader.count(), 0, "{}", codec.name());
+    }
+}

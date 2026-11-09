@@ -108,6 +108,20 @@ mod tests {
         }
         assert!(read_long_at(&[0xff; 10], &mut 0).is_err());
         assert!(read_long_at(&[0x80], &mut 0).is_err());
+        // The ends of i64 take all ten bytes; the tenth holds the one bit left.
+        let mut max = vec![0xfe];
+        max.extend([0xff; 8]);
+        max.push(0x01);
+        assert_eq!(long(i64::MAX), max);
+        assert_eq!(long(i64::MIN), [[0xff; 9].as_slice(), &[0x01]].concat());
+        let mut pos = 0;
+        assert_eq!(read_long_at(&max, &mut pos).unwrap(), i64::MAX);
+        assert_eq!(pos, 10);
+        // A tenth byte with more than that bit, or an eleventh byte, is past 64 bits.
+        assert!(read_long_at(&[[0xff; 9].as_slice(), &[0x02]].concat(), &mut 0).is_err());
+        assert!(read_long_at(&[[0xff; 9].as_slice(), &[0x81, 0x00]].concat(), &mut 0).is_err());
+        // Overlong but in range (as Java accepts): zero in two bytes.
+        assert_eq!(read_long_at(&[0x80, 0x00], &mut 0).unwrap(), 0);
     }
 
     #[test]

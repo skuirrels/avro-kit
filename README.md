@@ -26,4 +26,8 @@ w.finish()?;
 
 ## Tests
 
-`cargo test` runs the unit tests and an oracle test: files written with every codec are read back by the Apache Avro library (`apache-avro`, a dev-dependency only), and blocks it writes decompress with this crate's codecs.
+`cargo test` runs the unit tests and an oracle test: files written with every codec are read back by the Apache Avro library (`apache-avro`, a dev-dependency only), and blocks it writes decompress with this crate's codecs. A third test counts allocations to check that a hostile block is refused without decompressing past the limit.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

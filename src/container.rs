@@ -35,6 +35,8 @@ impl Default for WriterOptions {
     }
 }
 
+/// Writes an object container file. Call [`Writer::finish`] at the end: dropping a writer
+/// without it loses the records of the last block.
 pub struct Writer<W: Write> {
     inner: W,
     codec: Codec,
@@ -54,8 +56,15 @@ impl<W: Write> Writer<W> {
     /// and get ready for records.
     pub fn new(mut inner: W, schema: &str, opts: WriterOptions) -> io::Result<Self> {
         let metadata: Vec<&(String, Vec<u8>)> = opts.metadata.iter().filter(|(k, _)| !k.trim().is_empty()).collect();
+        let invalid = |m: String| io::Error::new(io::ErrorKind::InvalidInput, m);
         if let Some((k, _)) = metadata.iter().find(|(k, _)| k.starts_with("avro.")) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("metadata key {k} is reserved (keys starting avro. are)")));
+            return Err(invalid(format!("metadata key {k} is reserved (keys starting avro. are)")));
+        }
+        // The header's metadata is a map: a key given twice would leave readers keeping one.
+        for (i, (k, _)) in metadata.iter().enumerate() {
+            if metadata[..i].iter().any(|(earlier, _)| earlier == k) {
+                return Err(invalid(format!("metadata key {k} is given twice")));
+            }
         }
         let sync = opts.sync.unwrap_or_else(random_sync);
         let mut head = MAGIC.to_vec();
@@ -124,6 +133,7 @@ impl<W: Write> Writer<W> {
             return Ok(());
         }
         let data = self.codec.compress(&self.block, self.level)?;
+        check_block_size(data.len())?;
         let mut head = Vec::with_capacity(20);
         write_long(&mut head, self.count as i64);
         write_long(&mut head, data.len() as i64);
@@ -158,7 +168,22 @@ impl<W: Write> Writer<W> {
     }
 }
 
-/// A sync marker that differs from file to file.
+/// The largest block the Java library reads: its reader refuses a block size over `i32::MAX`.
+pub const MAX_BLOCK_SIZE: usize = i32::MAX as usize;
+
+fn check_block_size(n: usize) -> io::Result<()> {
+    if n > MAX_BLOCK_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a block of {n} bytes is larger than Avro readers accept ({MAX_BLOCK_SIZE}); write fewer records per block"),
+        ));
+    }
+    Ok(())
+}
+
+/// A sync marker that differs from file to file: 128 bits of SipHash keyed from the operating
+/// system's randomness (std's `RandomState`, whose keys also differ between calls), over the
+/// time. Sync markers only need to be unlikely to occur in the data, not secret.
 pub fn random_sync() -> [u8; 16] {
     use std::hash::{BuildHasher, Hasher};
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
@@ -174,15 +199,7 @@ pub fn random_sync() -> [u8; 16] {
 
 /// A sync marker written as 32 hex digits (whitespace ignored).
 pub fn parse_sync(hex: &str) -> Option<[u8; 16]> {
-    let h: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
-    if h.len() != 32 || !h.is_ascii() {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (k, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&h[2 * k..2 * k + 2], 16).ok()?;
-    }
-    Some(out)
+    crate::text::hex16(&hex.chars().filter(|c| !c.is_whitespace()).collect::<String>())
 }
 
 #[cfg(test)]
@@ -240,10 +257,27 @@ mod tests {
     }
 
     #[test]
+    fn metadata_keys_given_twice_are_refused() {
+        let o = WriterOptions { metadata: vec![("app".into(), b"a".to_vec()), ("v".into(), b"1".to_vec()), ("app".into(), b"b".to_vec())], ..opts(0) };
+        let e = Writer::new(Vec::new(), r#""null""#, o).err().unwrap();
+        assert!(e.to_string().contains("app is given twice"), "{e}");
+    }
+
+    #[test]
+    fn blocks_java_cannot_read_are_refused() {
+        assert!(check_block_size(MAX_BLOCK_SIZE).is_ok());
+        assert!(check_block_size(MAX_BLOCK_SIZE + 1).is_err());
+    }
+
+    #[test]
     fn sync_markers() {
         assert_eq!(parse_sync("000102030405060708090a0b0c0d0e0f"), Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]));
+        assert_eq!(parse_sync("00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F"), Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]));
         assert_eq!(parse_sync("00 01"), None);
         assert_eq!(parse_sync("zz0102030405060708090a0b0c0d0e0f"), None);
-        assert_ne!(random_sync(), random_sync());
+        // from_str_radix takes a sign: "+f" is not two hex digits
+        assert_eq!(parse_sync("+f0102030405060708090a0b0c0d0e0f"), None);
+        let markers: std::collections::HashSet<[u8; 16]> = (0..1000).map(|_| random_sync()).collect();
+        assert_eq!(markers.len(), 1000);
     }
 }

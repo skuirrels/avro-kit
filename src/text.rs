@@ -44,7 +44,7 @@ impl Unit {
 
 /// An integer: digits with an optional sign, or a decimal with a zero fraction (`12.0`).
 pub fn parse_integer(t: &str) -> Option<i64> {
-    let t = t.strip_prefix('+').unwrap_or(t);
+    // Rust's parse takes one `+` or `-` itself.
     if let Ok(v) = t.parse::<i64>() {
         return Some(v);
     }
@@ -130,7 +130,8 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// The year, month and day of a number of days since 1970-01-01, for any number.
 pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
+    // In 128 bits: the shift to 0000-03-01 would overflow near i64's ends.
+    let z = i128::from(z) + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
@@ -138,7 +139,8 @@ pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (yoe + era * 400 + i64::from(m <= 2), m, d)
+    let y = yoe + era * 400 + i128::from(m <= 2);
+    (y as i64, m as i64, d as i64)
 }
 
 /// A date (days since 1970-01-01) as `xs:date`: at least four year digits, a minus sign before
@@ -213,7 +215,7 @@ fn civil_days(t: &str) -> Option<i64> {
 
 /// Days since 1970-01-01 of an `xs:date` (or the date of an `xs:dateTime`).
 pub fn parse_date(t: &str) -> Option<i64> {
-    let d = t.split(['T', ' ']).next()?;
+    let d = t.trim().split(['T', ' ']).next()?;
     civil_days(if d.len() > 10 { strip_zone(d) } else { d })
 }
 
@@ -232,11 +234,15 @@ fn clock(time: &str, max_hour: i64) -> Option<(i64, i64)> {
         _ => return None,
     };
     let frac = frac.unwrap_or("");
-    if h > max_hour || m > 59 || s > 60 || (h == 24 && (m, s) != (0, 0)) || !frac.bytes().all(|c| c.is_ascii_digit()) || time.ends_with('.') {
+    if h > max_hour || m > 59 || s > 60 || !frac.bytes().all(|c| c.is_ascii_digit()) || time.ends_with('.') {
         return None;
     }
     let digits: String = frac.chars().take(9).collect();
     let nanos: i64 = if digits.is_empty() { 0 } else { format!("{digits:0<9}").parse().ok()? };
+    // 24:00:00 is the end of the day, and nothing after it.
+    if h == 24 && (m, s, frac.bytes().any(|c| c != b'0')) != (0, 0, false) {
+        return None;
+    }
     if s == 60 {
         return Some((h * 3600 + m * 60 + 59, 999_999_999));
     }
@@ -245,7 +251,7 @@ fn clock(time: &str, max_hour: i64) -> Option<(i64, i64)> {
 
 /// Nanoseconds after midnight of an `xs:time` (a time zone is ignored).
 pub fn parse_time(t: &str) -> Option<i64> {
-    let (secs, nanos) = clock(strip_zone(t), 23)?;
+    let (secs, nanos) = clock(strip_zone(t.trim()), 23)?;
     Some(secs * 1_000_000_000 + nanos)
 }
 
@@ -260,10 +266,11 @@ pub fn parse_timestamp(t: &str, u: Unit, utc: bool) -> Option<i64> {
         None => {
             let b = t.as_bytes();
             match t.len().checked_sub(6) {
-                Some(k) if k > 10 && matches!(b[k], b'+' | b'-') && b[k + 3] == b':' => {
-                    let h: i64 = t[k + 1..k + 3].parse().ok()?;
-                    let m: i64 = t[k + 4..].parse().ok()?;
-                    if h > 14 || m > 59 {
+                // `k >= 10`: after a whole date, which may be all there is (`2025-11-08+01:00`).
+                Some(k) if k >= 10 && matches!(b[k], b'+' | b'-') && b[k + 3] == b':' => {
+                    let two = |x: &str| (x.len() == 2 && x.bytes().all(|c| c.is_ascii_digit())).then(|| x.parse::<i64>().ok()).flatten();
+                    let (h, m) = (two(&t[k + 1..k + 3])?, two(&t[k + 4..])?);
+                    if m > 59 || (h, m) > (14, 0) {
                         return None;
                     }
                     let off = (h * 60 + m) * 60;
@@ -274,11 +281,14 @@ pub fn parse_timestamp(t: &str, u: Unit, utc: bool) -> Option<i64> {
         }
     };
     let (date, time) = match body.find(['T', ' ']) {
-        Some(k) if k >= 10 => (&body[..k], &body[k + 1..]),
-        _ => (body, ""),
+        Some(k) if k >= 10 => (&body[..k], Some(&body[k + 1..])),
+        _ => (body, None),
     };
     let days = civil_days(date)?;
-    let (secs, nanos) = if time.is_empty() { (0, 0) } else { clock(time, 24)? };
+    let (secs, nanos) = match time {
+        Some(time) => clock(time, 24)?,
+        None => (0, 0),
+    };
     let secs = i128::from(days) * 86_400 + i128::from(secs) - if utc { i128::from(offset) } else { 0 };
     let per = i128::from(u.per_second());
     let units = secs * per + i128::from(nanos) * per / 1_000_000_000;
@@ -299,8 +309,12 @@ pub fn uuid_text(b: &[u8]) -> String {
 
 /// A UUID's 16 bytes, from 32 hex digits with or without the dashes.
 pub fn parse_uuid(t: &str) -> Option<[u8; 16]> {
-    let h: String = t.chars().filter(|c| *c != '-').collect();
-    if h.len() != 32 || !h.is_ascii() {
+    hex16(&t.trim().chars().filter(|c| *c != '-').collect::<String>())
+}
+
+/// 16 bytes from exactly 32 hex digits. (`u8::from_str_radix` alone would take `+f`.)
+pub(crate) fn hex16(h: &str) -> Option<[u8; 16]> {
+    if h.len() != 32 || !h.bytes().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 16];
@@ -329,23 +343,52 @@ pub fn duration_text(b: &[u8; 12]) -> String {
     if s == "P" { "PT0S".into() } else { s }
 }
 
+/// Fraction digits kept of an hour, minute or second count: at most 3.6e-12 ms is dropped, too
+/// little to move the rounding to whole milliseconds.
+const DURATION_DIGITS: u32 = 18;
+
+/// `num` (digits, perhaps with a fraction) times `unit` milliseconds, exactly, in units of
+/// 10^-[`DURATION_DIGITS`] ms. `None` for what isn't a number; `Some(None)` for too large.
+fn scaled_millis(num: &str, unit: u128) -> Option<Option<u128>> {
+    let (int, frac) = num.split_once('.').unwrap_or((num, ""));
+    if (int.is_empty() && frac.is_empty()) || !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let frac: String = frac.chars().take(DURATION_DIGITS as usize).collect();
+    let scale = 10u128.pow(DURATION_DIGITS);
+    let int = int.trim_start_matches('0');
+    // Anything with more digits than this is far past u32::MAX milliseconds.
+    if int.len() > 20 {
+        return Some(None);
+    }
+    let int: u128 = if int.is_empty() { 0 } else { int.parse().ok()? };
+    let frac_value: u128 = if frac.is_empty() { 0 } else { frac.parse::<u128>().ok()? * 10u128.pow(DURATION_DIGITS - frac.len() as u32) };
+    Some(int.checked_mul(scale).and_then(|i| i.checked_add(frac_value)).and_then(|v| v.checked_mul(unit)))
+}
+
 /// The 12 bytes of an `xs:duration`. Years become months and weeks days; hours, minutes and
-/// seconds become milliseconds. The error finishes a sentence about the text ("is negative...").
+/// seconds become milliseconds, rounded half away from zero. The error finishes a sentence about
+/// the text ("is negative...").
 pub fn parse_duration(t: &str) -> Result<[u8; 12], String> {
+    let t = t.trim();
     if t.starts_with('-') {
         return Err("is negative; an Avro duration cannot be".into());
     }
     let body = t.strip_prefix('P').ok_or("is not a duration")?;
     let (date, time) = body.split_once('T').unwrap_or((body, ""));
-    let (mut months, mut days, mut millis) = (0u64, 0u64, 0f64);
+    // A `T` needs a time after it (`P1DT` is not a duration).
+    if body.contains('T') && time.is_empty() {
+        return Err("is not a duration".into());
+    }
+    let too_long = "is too long for an Avro duration";
+    let (mut months, mut days, mut scaled) = (0u64, 0u64, 0u128);
     let mut num = String::new();
     for c in date.chars() {
         match c {
             '0'..='9' => num.push(c),
             'Y' | 'M' | 'W' | 'D' => {
-                let v: u64 = num.parse().map_err(|_| "is not a duration")?;
+                let v: u64 = num.parse().map_err(|_| if num.is_empty() { "is not a duration" } else { too_long })?;
                 num.clear();
-                let too_long = "is too long for an Avro duration";
                 let (total, add) = match c {
                     'Y' => (&mut months, v.checked_mul(12)),
                     'M' => (&mut months, Some(v)),
@@ -361,13 +404,14 @@ pub fn parse_duration(t: &str) -> Result<[u8; 12], String> {
         match c {
             '0'..='9' | '.' => num.push(c),
             'H' | 'M' | 'S' => {
-                let v: f64 = num.parse().map_err(|_| "is not a duration")?;
-                num.clear();
-                millis += v * match c {
-                    'H' => 3_600_000.0,
-                    'M' => 60_000.0,
-                    _ => 1000.0,
+                let unit = match c {
+                    'H' => 3_600_000,
+                    'M' => 60_000,
+                    _ => 1000,
                 };
+                let v = scaled_millis(&num, unit).ok_or("is not a duration")?.ok_or(too_long)?;
+                num.clear();
+                scaled = scaled.checked_add(v).ok_or(too_long)?;
             }
             _ => return Err("is not a duration".into()),
         }
@@ -375,9 +419,10 @@ pub fn parse_duration(t: &str) -> Result<[u8; 12], String> {
     if !num.is_empty() || (date.is_empty() && time.is_empty()) {
         return Err("is not a duration".into());
     }
-    let millis = millis.round();
-    if months > u64::from(u32::MAX) || days > u64::from(u32::MAX) || millis > f64::from(u32::MAX) {
-        return Err("is too long for an Avro duration".into());
+    let half = 10u128.pow(DURATION_DIGITS) / 2;
+    let millis = scaled.checked_add(half).ok_or(too_long)? / 10u128.pow(DURATION_DIGITS);
+    if months > u64::from(u32::MAX) || days > u64::from(u32::MAX) || millis > u128::from(u32::MAX) {
+        return Err(too_long.into());
     }
     let mut out = [0u8; 12];
     out[..4].copy_from_slice(&(months as u32).to_le_bytes());
@@ -563,6 +608,9 @@ pub fn decimal_bytes(t: &str, scale: u32, precision: Option<u32>, size: Option<u
             digits.push('0');
         }
     }
+    if digits.len() > MAX_DECIMAL_DIGITS {
+        return Err(format!("a decimal of more than {MAX_DECIMAL_DIGITS} digits is not supported"));
+    }
     if let Some(p) = precision
         && digits != "0"
         && digits.len() > p as usize
@@ -733,5 +781,97 @@ mod tests {
         assert_eq!(parse_uuid("123e4567e89b12d3a456426614174000"), Some(u));
         assert_eq!(parse_uuid("123e4567"), None);
         assert_eq!(parse_uuid("ä23e4567e89b12d3a45642661417400"), None);
+    }
+
+    #[test]
+    fn integers_take_one_sign() {
+        assert_eq!(parse_integer("+5"), Some(5));
+        assert_eq!(parse_integer("-5"), Some(-5));
+        assert_eq!(parse_integer("+-5"), None);
+        assert_eq!(parse_integer("++5"), None);
+        assert_eq!(parse_integer("+-5.0"), None);
+        assert_eq!(parse_integer("-12.00"), Some(-12));
+    }
+
+    #[test]
+    fn dates_at_the_ends_of_i64_do_not_overflow() {
+        for d in [i64::MAX, i64::MIN, i64::MAX - 719_468, i64::MIN + 1] {
+            let t = date_text(d);
+            assert!(t.len() > 10, "{t}");
+        }
+        assert_eq!(civil_from_days(-719_528), (0, 1, 1));
+        assert_eq!(parse_date(" 2026-11-08 "), Some(20765));
+    }
+
+    #[test]
+    fn the_end_of_the_day_has_no_fraction() {
+        let midnight = parse_timestamp("2025-01-02T00:00:00Z", Unit::Nanos, true);
+        assert_eq!(parse_timestamp("2025-01-01T24:00:00Z", Unit::Nanos, true), midnight);
+        assert_eq!(parse_timestamp("2025-01-01T24:00:00.000Z", Unit::Nanos, true), midnight);
+        assert_eq!(parse_timestamp("2025-01-01T24:00:00.5Z", Unit::Nanos, true), None);
+        assert_eq!(parse_timestamp("2025-01-01T24:00:01Z", Unit::Nanos, true), None);
+    }
+
+    #[test]
+    fn timestamp_zones() {
+        // A date with an offset and no time.
+        assert_eq!(parse_timestamp("2025-11-08+01:00", Unit::Millis, true), parse_timestamp("2025-11-07T23:00:00Z", Unit::Millis, true));
+        assert_eq!(parse_timestamp("2025-11-08-05:00", Unit::Millis, false), parse_timestamp("2025-11-08", Unit::Millis, false));
+        assert_eq!(parse_timestamp("-0001-12-31+14:00", Unit::Millis, true).map(|v| v + 14 * 3_600_000), parse_timestamp("-0001-12-31", Unit::Millis, true));
+        // Offsets are two digits each, at most 14:00.
+        assert_eq!(parse_timestamp("2025-11-08T00:00:00++1:00", Unit::Millis, true), None);
+        assert_eq!(parse_timestamp("2025-11-08T00:00:00+1:000", Unit::Millis, true), None);
+        assert_eq!(parse_timestamp("2025-11-08T00:00:00+14:30", Unit::Millis, true), None);
+        assert!(parse_timestamp("2025-11-08T00:00:00-14:00", Unit::Millis, true).is_some());
+        // A `T` needs a time.
+        assert_eq!(parse_timestamp("2025-11-08T", Unit::Millis, true), None);
+        assert_eq!(parse_timestamp("2025-11-08TZ", Unit::Millis, true), None);
+        // A leap second is the last instant of the minute before.
+        assert_eq!(parse_timestamp("2016-12-31T23:59:60Z", Unit::Millis, true), parse_timestamp("2016-12-31T23:59:59.999Z", Unit::Millis, true));
+        assert_eq!(parse_time(" 13:45:00 "), Some(49_500_000_000_000));
+    }
+
+    #[test]
+    fn uuids_are_hex_digits_only() {
+        assert_eq!(parse_uuid("+23e4567-e89b-12d3-a456-426614174000"), None);
+        assert_eq!(parse_uuid("123E4567-E89B-12D3-A456-426614174000"), parse_uuid("123e4567-e89b-12d3-a456-426614174000"));
+    }
+
+    #[test]
+    fn durations_round_exactly() {
+        let millis = |t: &str| parse_duration(t).map(|b| u32::from_le_bytes(b[8..].try_into().unwrap()));
+        // 1.0005 is 1.000499999... as a double: an f64 sum rounded this to 1000.
+        assert_eq!(millis("PT1.0005S"), Ok(1001));
+        assert_eq!(millis("PT1.0004999S"), Ok(1000));
+        assert_eq!(millis("PT0.0005S"), Ok(1));
+        assert_eq!(millis("PT1.5H"), Ok(5_400_000));
+        assert_eq!(millis("PT1H2M3.25S"), Ok(3_723_250));
+        assert_eq!(millis("PT0.00000000000000000000001S"), Ok(0));
+        assert_eq!(millis("PT1193H2M47.295S"), Ok(u32::MAX));
+        assert_eq!(millis("PT1193H2M47.296S"), Err("is too long for an Avro duration".into()));
+        assert_eq!(millis("PT99999999999999999999999999H"), Err("is too long for an Avro duration".into()));
+        for bad in ["P1DT", "PT", "P", "PT1.2.3S", "PT.S", "PTS", "P1.5D", "P-1D", "-PT1S"] {
+            assert!(parse_duration(bad).is_err(), "{bad}");
+        }
+        let d = parse_duration("P2W1D").unwrap();
+        assert_eq!(u32::from_le_bytes(d[4..8].try_into().unwrap()), 15);
+    }
+
+    #[test]
+    fn decimal_digits_are_limited_after_rescaling() {
+        let digits = "9".repeat(MAX_DECIMAL_DIGITS - 5);
+        assert!(decimal_bytes(&digits, 0, None, None).is_ok());
+        assert!(decimal_bytes(&digits, 10, None, None).unwrap_err().contains("not supported"));
+        // half away from zero, at the edge of the precision
+        assert_eq!(decimal_bytes("9.995", 2, Some(3), None).unwrap_err(), r#""9.995" needs 4 digits at scale 2, more than the precision of 3"#);
+        assert_eq!(decimal_bytes("-0.005", 2, Some(1), None).unwrap(), [0xff]);
+        assert_eq!(decimal_bytes("-0.004", 2, Some(1), None).unwrap(), [0x00]);
+        // a negative scale reads back as a power of ten
+        let mut big = Vec::new();
+        write_bytes(&mut big, &[0x0f]);
+        write_long(&mut big, -2);
+        assert_eq!(big_decimal_text(&big).unwrap(), "1500");
+        assert_eq!(decimal_text(&[0x80, 0x00], 0).unwrap(), "-32768");
+        assert_eq!(decimal_text(&[0xff, 0xff], 1).unwrap(), "-0.1");
     }
 }

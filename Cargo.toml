@@ -11,8 +11,10 @@ publish = false
 base64 = "0.23.1"
 bzip2 = "0.6.1"
 crc32fast = "1.5.4"
-lzma-rs = "0.3.0"
-miniz_oxide = "0.9.1"
+# deflate through flate2 (its default backend is miniz_oxide, pure Rust): Mapster wrote with it,
+# and miniz_oxide's one-shot compress_to_vec differs from flate2's streaming at level 1
+flate2 = "1.1.11"
+lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
 ruzstd = "0.9.1"
 snap = "1.1.2"
 
