@@ -1,0 +1,20 @@
+[package]
+name = "avro-kit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Apache Avro building blocks shared by Tessera and Mapster: values, binary encoding, codecs, a streaming container writer, and text forms of logical types"
+publish = false
+
+[dependencies]
+base64 = "0.23.1"
+bzip2 = "0.6.1"
+crc32fast = "1.5.4"
+lzma-rs = "0.3.0"
+miniz_oxide = "0.9.1"
+ruzstd = "0.9.1"
+snap = "1.1.2"
+
+[dev-dependencies]
+apache-avro = { version = "0.22.0", features = ["snappy", "zstandard", "bzip", "xz"] }
